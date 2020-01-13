@@ -28,6 +28,4 @@ setup(name='babelfish-models',
           'Programming Language :: Python :: 3.6',
       ],
       keywords='neuroscience 2P',
-      setup_requires=['pytest-runner'],
-      tests_require=['pytest'],
       )
