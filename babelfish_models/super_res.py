@@ -70,6 +70,7 @@ class SuperResSkip(Vol2D):
         self.initialize_weights()
 
     def forward(self, x, layer_output):
+        # x: B x Z x C x H x W
         x_chan = x.shape[2]
         new_x = self.tensor(x.shape[0], x.shape[1], x_chan+layer_output.shape[2],
                        x.shape[3], x.shape[4])

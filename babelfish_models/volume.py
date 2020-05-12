@@ -13,7 +13,8 @@ class Vol2D(nn.Module):
         first = self.pixel_shuffle(x[:,0])
         # b x z x C x H x W
         ret = self.tensor(x.shape[0],x.shape[1],first.shape[1], first.shape[2], first.shape[3])
-        for z in range(x.shape[1]):
+        ret[:,0] = first
+        for z in range(1,x.shape[1]):
             ret[:,z] = self.pixel_shuffle(x[:,z])
         return ret
 

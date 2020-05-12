@@ -13,27 +13,31 @@ import mlflow
 
 
 class DeepSkip(Vol2D):
-    def __init__(self, nZ=11, H=232, W=512, nEmbedding=20, prev_frames=1, next_frames=1,
-                 pred_hidden=20, tensor=T.cuda.FloatTensor):
+    def __init__(self, nC=1, nZ=11, H=232, W=512, nEmbedding=20, prev_frames=1,
+                 next_frames=1, lowC=1, lowH=16, lowW=16, pred_hidden=20,
+                 resOut=64, tensor=T.cuda.FloatTensor):
         super(DeepSkip, self).__init__(tensor)
         self.tensor = tensor
         self.nZ = nZ
+        self.nC = nC
+        if nC > 1:
+            raise ValueError("haven't tested nC>1 yet.. need to fix superRes output")
         self.H = H
         self.W = W
-        self.lowH = 16
-        self.lowW = 16
-        self.lowFeatures = 1
+        self.lowH = lowH
+        self.lowW = lowW
+        self.lowC = lowC
         self.prev_frames = prev_frames
-        # batch x channel x Z x H x W
+        # batch x time x channel x Z x H x W
         # Encoding
-        self.resnet = ResNet(BasicBlock, [2, 2, 2, 2], prev_frames)
-        self.resOut = 64
+        self.resnet = ResNet(BasicBlock, [2, 2, 2, 2], prev_frames*nC)
+        self.resOut = resOut # per Z*C
         self.nEmbedding = nEmbedding
         assert nEmbedding % 2 == 0
 
         # b x 11 x 32 x 11 x 25
-        self.encoding_mean = nn.Linear(self.resOut*self.nZ, nEmbedding)
-        self.encoding_logvar = nn.Linear(self.resOut*self.nZ, nEmbedding)
+        self.encoding_mean = nn.Linear(self.resOut*nZ*nC, nEmbedding)
+        self.encoding_logvar = nn.Linear(self.resOut*nZ*nC, nEmbedding)
         self.nhalf_embed = int(self.nEmbedding/2)
         # Prediction
         self.pred1 = nn.Linear(self.nhalf_embed, pred_hidden) # add dim for shock_{t+1}
@@ -46,17 +50,24 @@ class DeepSkip(Vol2D):
         # Decoding
         self.activation = nn.Tanh()
         # only use 10 embeddings for frame decoding, the other 10 are context
-        self.decoding = nn.Linear(self.nhalf_embed, self.lowFeatures*nZ*self.lowH*self.lowW)
-        self.upconv1 = SuperResSkip(2,65,tensor)
-        # 11 x 16 x 32
-        self.upconv2 = SuperResSkip(2,65,tensor)
-        # 11 x 32 x 64
-        self.upconv3 = SuperResSkip(2,65,tensor)
-        # 11 x 64 x 128
-        self.upconv4 = SuperResSkip(2,65,tensor)
-        # 11 x 128 x 256
+        decode_output = self.lowC*nZ*nC*self.lowH*self.lowW
+        try:
+            assert decode_output == nC*nZ*lowC*lowW*lowH
+        except:
+            print(f"{decode_output} != {nC*nZ*lowC*lowW*lowH}")
+            raise()
+        self.decoding = nn.Linear(self.nhalf_embed,
+                                  decode_output)
+        self.upconv1 = SuperResSkip(2,resOut+1,tensor, nC)
+        # 11 x 32 x 32
+        self.upconv2 = SuperResSkip(2,resOut+1,tensor, nC)
+        # 11 x 64 x 64
+        self.upconv3 = SuperResSkip(2,resOut+1,tensor, nC)
+        # 11 x 128 x 128
+        self.upconv4 = SuperResSkip(2,resOut+1,tensor, nC)
+        # 11 x 256 x 256
 #         self.upconv5 = SuperResSkip(2,tensor)
-        # 11 x 256 x 512
+        # 11 x 512 x 512
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -72,14 +83,18 @@ class DeepSkip(Vol2D):
         else:
             return mu
 
-    def encode(self, x):
-        x = x.transpose(1,2)
-        # X :: b x z x t x h x w
+    def encode(self, x:T.Tensor):
+        # batch x time x channel x Z x H x W
+        x = x.permute(0,3,1,2,4,5)
+        # X :: b x z x t x c x h x w
+        shape = x.shape
         out = self.tensor(x.shape[0],x.shape[1],self.resOut)
         layers = ["conv1_out", "layer1_out", "layer2_out", "layer3_out", "layer4_out"]
         layer_outputs = {k: [] for k in layers}
         for z in range(x.shape[1]):
-            out[:,z], layer_out = self.resnet(x[:,z])
+            # combine nChannels & previous frames into same dimension
+            z_plane = x[:,z].reshape(shape[0],shape[2]*shape[3], *shape[4:])
+            out[:,z], layer_out = self.resnet(z_plane)
             for k in layers:
                 layer_outputs[k].append(layer_out[k])
         layer_outputs = {k: T.stack(v,1) for k,v in layer_outputs.items()}
@@ -101,7 +116,7 @@ class DeepSkip(Vol2D):
         # b x 10
         # only use first half for brain data
         x = self.activation(self.decoding(x[:,:int(self.nEmbedding/2)]))
-        x = x.reshape(x.shape[0],self.nZ,self.lowFeatures,self.lowH,self.lowW)
+        x = x.reshape(x.shape[0], self.nZ,self.lowC,self.lowH,self.lowW)
 #         print("upconv1", x.shape)
         x = self.upconv1(x, layer_output["layer3_out"])
 #         print("upconv2", x.shape)
@@ -111,16 +126,16 @@ class DeepSkip(Vol2D):
 #         print("upconv4", x.shape)
         x = self.upconv4(x, layer_output["conv1_out"])
 #         x = self.upconv5(x)
-        x = self.crop(x[:,:,0])
-        # squeeze channel
-        return x
+        # x = self.crop(x)
+        # print("out", x.shape)
+        # Swap Z & C so C is first (SuperResSkip processes by Z layer )
+        return T.transpose(x,1,2)
 
     def forward(self, x):
         """Return Previous volume (denoised), next volume (prediction), latent mean and logvar.
         
         x is B x T x Z x H x W
         """
-
         output = self.encode(x)
         mean = output["mean"]
         logvar = output["logvar"]
@@ -142,7 +157,7 @@ def unit_norm_KL_divergence(mu, logvar):
     return -0.5 * T.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
 
-def train(model,train_data,valid_data, nepochs=10, lr=1e-3, kl_lambda=1, half=False, cuda=True, batch_size=16, num_workers=8):
+def train(model,train_data,valid_data, nepochs=10, lr=1e-3, kl_lambda=1, half=False, cuda=True, batch_size=16, num_workers=8, log=True):
     # TODO allow specifying device
     dataloader = DataLoader(train_data, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True)
@@ -184,7 +199,7 @@ def train(model,train_data,valid_data, nepochs=10, lr=1e-3, kl_lambda=1, half=Fa
             mse_X = F.mse_loss(X_pred, Y[:,0])
             mse_Y = F.mse_loss(Y_pred, Y[:,-1])
             loss = mse_X + mse_Y + kl_lambda*kl_schedule[e] * kld
-            if e==0:
+            if e==0 and log:
                 mlflow.log_metrics({
                     "MSE_X": float(mse_X)/batch_size,
                     "MSE_Y": float(mse_Y)/batch_size,
@@ -206,21 +221,26 @@ def train(model,train_data,valid_data, nepochs=10, lr=1e-3, kl_lambda=1, half=Fa
         avg_Y_loss = cum_Y_loss/len(train_data)
         avg_X_loss = cum_X_loss/len(train_data)
         avg_KLD_loss = cum_kld_loss/len(train_data)
-        mlflow.log_metrics({
-            "avg_loss": avg_loss,
-            "MSE_X": avg_X_loss,
-            "MSE_Y": avg_Y_loss,
-            "KLD": avg_KLD_loss
-            }, step=e)
+        if log:
+            mlflow.log_metrics({
+                "avg_loss": avg_loss,
+                "MSE_X": avg_X_loss,
+                "MSE_Y": avg_Y_loss,
+                "KLD": avg_KLD_loss
+                }, step=e)
+            mlflow.pytorch.log_model(model, f"models/epoch/{e}")
         print("avg_loss: {:3E}, X_loss: {:3E}, Y_loss: {:3E}, KLD: {:3E}".format(
             avg_loss, avg_X_loss, avg_Y_loss, avg_KLD_loss))
-        mlflow.pytorch.log_model(model, f"models/epoch/{e}")
+        if not valid_data is None:
+            validation_loss(model,valid_data, kl_lambda, half, cuda,
+                            batch_size, num_workers, log)
     return avg_X_loss, avg_Y_loss
 
 
-def validation_loss(model,valid_data, kl_lambda=1, half=False, cuda=True, batch_size=16, num_workers=8):
+def validation_loss(model,valid_data, kl_lambda=1, half=False, cuda=True,
+                    batch_size=16, num_workers=8, log=False):
     valid_dataloader = DataLoader(valid_data, batch_size=batch_size,
-        shuffle=True, num_workers=num_workers, pin_memory=True)
+        shuffle=True, num_workers=num_workers, pin_memory=True, log=False)
     cum_loss = 0
     cum_X_loss = 0
     cum_Y_loss = 0
@@ -253,10 +273,20 @@ def validation_loss(model,valid_data, kl_lambda=1, half=False, cuda=True, batch_
             cum_Y_loss += float(mse_Y)
             cum_kld_loss += float(kld)
     model.train()
+    avg_cum_loss = cum_loss/len(valid_data)
     avg_Y_valid_loss = cum_Y_loss/len(valid_data)
     avg_X_valid_loss = cum_X_loss/len(valid_data)
+    avg_kld_loss = cum_kld_loss/len(valid_data)
+    if log:
+        mlflow.log_metrics({
+            "validation_avg_loss": avg_cum_loss,
+            "validation_MSE_X": avg_X_valid_loss,
+            "validation_MSE_Y": avg_Y_valid_loss,
+            "validation_KLD": avg_kld_loss
+            }, step=e)
+
     print("VALIDATION: avg_loss: {:3E}, X_loss: {:3E}, Y_loss: {:3E}, KLD: {:3E}".format(
-    cum_loss/len(valid_data), cum_X_loss/len(valid_data), avg_Y_valid_loss, cum_kld_loss/len(valid_data)))
+        avg_cum_loss, avg_X_valid_loss, avg_Y_valid_loss, avg_kld_loss))
     return avg_X_valid_loss, avg_Y_valid_loss
 
 def deep_skip_predict(model, batch, mask, plane):
