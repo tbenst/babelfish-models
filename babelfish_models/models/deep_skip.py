@@ -233,14 +233,14 @@ def train(model,train_data,valid_data, nepochs=10, lr=1e-3, kl_lambda=1, half=Fa
             avg_loss, avg_X_loss, avg_Y_loss, avg_KLD_loss))
         if not valid_data is None:
             validation_loss(model,valid_data, kl_lambda, half, cuda,
-                            batch_size, num_workers, log)
+                            batch_size, num_workers, log, e)
     return avg_X_loss, avg_Y_loss
 
 
 def validation_loss(model,valid_data, kl_lambda=1, half=False, cuda=True,
-                    batch_size=16, num_workers=8, log=False):
+        batch_size=16, num_workers=8, log=False, e=-1):
     valid_dataloader = DataLoader(valid_data, batch_size=batch_size,
-        shuffle=True, num_workers=num_workers, pin_memory=True, log=False)
+        shuffle=True, num_workers=num_workers, pin_memory=True)
     cum_loss = 0
     cum_X_loss = 0
     cum_Y_loss = 0
